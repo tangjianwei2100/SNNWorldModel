@@ -2,7 +2,7 @@
 
 SNN-style robot world model engineering prototype.
 
-Detailed tutorial: https://tangjian.me
+Detailed tutorial: http://tangjian.me
 
 ## Modules
 

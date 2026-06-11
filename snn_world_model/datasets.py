@@ -14,6 +14,63 @@ from .types import Action
 
 
 DATASET_SCHEMA = "snn-transition-v1"
+TRAJECTORY_LOG_SCHEMA = "snn-trajectory-log-v1"
+
+TRAJECTORY_LOG_STREAM_COLUMNS = (
+    "episode_id",
+    "step",
+    "time_s",
+    "command_left",
+    "command_right",
+    "state_x",
+    "state_y",
+    "state_theta",
+    "encoder_forward",
+    "encoder_turn",
+    "imu_yaw",
+    "motor_load",
+    "contact",
+)
+
+TRAJECTORY_LOG_METADATA_COLUMNS = (
+    "dataset_version",
+    "robot_id",
+    "routine",
+    "battery_voltage",
+    "floor_patch_id",
+    "payload_kg",
+    "wheel_condition",
+    "sensor_rate_hz",
+)
+
+TRAJECTORY_LOG_REQUIRED_COLUMNS = TRAJECTORY_LOG_STREAM_COLUMNS + TRAJECTORY_LOG_METADATA_COLUMNS
+
+
+@dataclass(frozen=True)
+class TrajectoryLogSummary:
+    schema: str
+    rows: int
+    episodes: int
+    routines: list[str]
+    dataset_versions: list[str]
+    max_step_gap: int
+    max_time_gap_s: float
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TrajectoryBuildSummary:
+    schema: str
+    source_rows: int
+    source_episodes: int
+    transition_count: int
+    dataset_versions: list[str]
+    routines: list[str]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -132,6 +189,140 @@ def write_transition_csv(transitions: list[Transition], path: str | Path) -> Non
 def read_transition_csv(path: str | Path) -> list[Transition]:
     with Path(path).open(encoding="utf-8", newline="") as file:
         return [row_to_transition(row) for row in csv.DictReader(file)]
+
+
+def trajectory_log_schema() -> dict:
+    return {
+        "schema": TRAJECTORY_LOG_SCHEMA,
+        "required_columns": list(TRAJECTORY_LOG_REQUIRED_COLUMNS),
+        "stream_columns": list(TRAJECTORY_LOG_STREAM_COLUMNS),
+        "metadata_columns": list(TRAJECTORY_LOG_METADATA_COLUMNS),
+        "acceptance_checks": [
+            "all required columns are present",
+            "metadata columns are non-empty for every row",
+            "step increments by 1 within each episode",
+            "time_s is monotonic within each episode",
+        ],
+    }
+
+
+def validate_trajectory_log_rows(rows: list[dict[str, str]]) -> TrajectoryLogSummary:
+    if not rows:
+        raise ValueError("trajectory log cannot be empty")
+
+    columns = set(rows[0].keys())
+    missing = [column for column in TRAJECTORY_LOG_REQUIRED_COLUMNS if column not in columns]
+    if missing:
+        raise ValueError(f"trajectory log missing required columns: {', '.join(missing)}")
+
+    episodes: dict[str, list[dict[str, str]]] = {}
+    routines: set[str] = set()
+    dataset_versions: set[str] = set()
+    for row_index, row in enumerate(rows, start=1):
+        for column in TRAJECTORY_LOG_METADATA_COLUMNS:
+            if not str(row[column]).strip():
+                raise ValueError(f"row {row_index} has empty metadata column: {column}")
+        episode_id = str(row["episode_id"])
+        episodes.setdefault(episode_id, []).append(row)
+        routines.add(str(row["routine"]))
+        dataset_versions.add(str(row["dataset_version"]))
+
+    max_step_gap = 0
+    max_time_gap_s = 0.0
+    for episode_id, episode_rows in episodes.items():
+        ordered = sorted(episode_rows, key=lambda row: int(row["step"]))
+        previous_step: int | None = None
+        previous_time: float | None = None
+        for row in ordered:
+            step = int(row["step"])
+            time_s = float(row["time_s"])
+            if previous_step is not None:
+                step_gap = step - previous_step
+                if step_gap != 1:
+                    raise ValueError(f"episode {episode_id} has non-contiguous step gap: {step_gap}")
+                time_gap = time_s - previous_time
+                if time_gap < 0:
+                    raise ValueError(f"episode {episode_id} has decreasing time_s")
+                max_step_gap = max(max_step_gap, step_gap)
+                max_time_gap_s = max(max_time_gap_s, time_gap)
+            previous_step = step
+            previous_time = time_s
+
+    return TrajectoryLogSummary(
+        schema=TRAJECTORY_LOG_SCHEMA,
+        rows=len(rows),
+        episodes=len(episodes),
+        routines=sorted(routines),
+        dataset_versions=sorted(dataset_versions),
+        max_step_gap=max_step_gap,
+        max_time_gap_s=max_time_gap_s,
+    )
+
+
+def validate_trajectory_log_csv(path: str | Path) -> TrajectoryLogSummary:
+    with Path(path).open(encoding="utf-8", newline="") as file:
+        rows = list(csv.DictReader(file))
+    return validate_trajectory_log_rows(rows)
+
+
+def trajectory_log_rows_to_transitions(rows: list[dict[str, str]]) -> list[Transition]:
+    validate_trajectory_log_rows(rows)
+    episodes: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        episodes.setdefault(str(row["episode_id"]), []).append(row)
+
+    transitions: list[Transition] = []
+    for episode_rows in episodes.values():
+        ordered = sorted(episode_rows, key=lambda row: int(row["step"]))
+        for current, following in zip(ordered, ordered[1:]):
+            transitions.append(
+                Transition(
+                    state=RobotState(
+                        float(current["state_x"]),
+                        float(current["state_y"]),
+                        float(current["state_theta"]),
+                    ),
+                    action=Action(
+                        float(current["command_left"]),
+                        float(current["command_right"]),
+                    ),
+                    next_state=RobotState(
+                        float(following["state_x"]),
+                        float(following["state_y"]),
+                        float(following["state_theta"]),
+                    ),
+                    reliability=float(current["contact"]),
+                    left_slip=0.0,
+                    right_slip=0.0,
+                    sensor_residual=SensorResidual(
+                        encoder_forward=float(current["encoder_forward"]),
+                        encoder_turn=float(current["encoder_turn"]),
+                        imu_yaw=float(current["imu_yaw"]),
+                        motor_load=float(current["motor_load"]),
+                        contact=float(current["contact"]),
+                    ),
+                )
+            )
+    return transitions
+
+
+def build_transition_dataset_from_trajectory_log(
+    trajectory_log_csv: str | Path,
+    transition_csv: str | Path,
+) -> TrajectoryBuildSummary:
+    with Path(trajectory_log_csv).open(encoding="utf-8", newline="") as file:
+        rows = list(csv.DictReader(file))
+    log_summary = validate_trajectory_log_rows(rows)
+    transitions = trajectory_log_rows_to_transitions(rows)
+    write_transition_csv(transitions, transition_csv)
+    return TrajectoryBuildSummary(
+        schema=DATASET_SCHEMA,
+        source_rows=log_summary.rows,
+        source_episodes=log_summary.episodes,
+        transition_count=len(transitions),
+        dataset_versions=log_summary.dataset_versions,
+        routines=log_summary.routines,
+    )
 
 
 def file_sha256(path: str | Path) -> str:
